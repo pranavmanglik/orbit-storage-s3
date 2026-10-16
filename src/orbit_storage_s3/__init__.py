@@ -14,7 +14,6 @@
 """Amazon S3 adapter for the optional Orbit Storage capability."""
 
 from orbit_storage_s3.config import S3Config
-from orbit_storage_s3.plugin import S3ObjectStorePlugin
 from orbit_storage_s3.store import S3ObjectStore
 
-__all__ = ["S3Config", "S3ObjectStore", "S3ObjectStorePlugin"]
+__all__ = ["S3Config", "S3ObjectStore"]

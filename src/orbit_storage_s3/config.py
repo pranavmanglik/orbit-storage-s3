@@ -22,7 +22,8 @@ from urllib.parse import urlsplit
 from orbit_storage import StorageConfigurationError
 
 _MIN_PART_SIZE = 5 * 1024 * 1024
-_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
+_MAX_PART_SIZE = 64 * 1024 * 1024
+_MAX_STREAM_BUFFER_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,8 +40,11 @@ class S3Config:
     endpoint_url: str | None = None
     allow_insecure_http: bool = False
     part_size_bytes: int = 8 * 1024 * 1024
+    max_concurrent_stream_uploads: int = 4
     max_parts: int = 10_000
+    total_max_attempts: int = 3
     read_chunk_size: int = 64 * 1024
+    max_concurrent_downloads: int = 16
     max_pool_connections: int = 50
     connect_timeout_seconds: float = 5.0
     read_timeout_seconds: float = 30.0
@@ -68,7 +72,20 @@ class S3Config:
             or not isinstance(self.part_size_bytes, int)
             or not _MIN_PART_SIZE <= self.part_size_bytes <= _MAX_PART_SIZE
         ):
-            raise StorageConfigurationError("S3 part_size_bytes must be between 5 MiB and 5 GiB.")
+            raise StorageConfigurationError("S3 part_size_bytes must be between 5 MiB and 64 MiB.")
+        if (
+            isinstance(self.max_concurrent_stream_uploads, bool)
+            or not isinstance(self.max_concurrent_stream_uploads, int)
+            or not 1 <= self.max_concurrent_stream_uploads <= 1024
+        ):
+            raise StorageConfigurationError(
+                "S3 max_concurrent_stream_uploads must be between 1 and 1024."
+            )
+        if self.part_size_bytes * self.max_concurrent_stream_uploads > _MAX_STREAM_BUFFER_BYTES:
+            raise StorageConfigurationError(
+                "S3 part_size_bytes multiplied by max_concurrent_stream_uploads "
+                "must not exceed 64 MiB."
+            )
         if (
             isinstance(self.max_parts, bool)
             or not isinstance(self.max_parts, int)
@@ -76,11 +93,29 @@ class S3Config:
         ):
             raise StorageConfigurationError("S3 max_parts must be between 1 and 10000.")
         if (
+            isinstance(self.total_max_attempts, bool)
+            or not isinstance(self.total_max_attempts, int)
+            or not 1 <= self.total_max_attempts <= 10
+        ):
+            raise StorageConfigurationError("S3 total_max_attempts must be between 1 and 10.")
+        if (
             isinstance(self.read_chunk_size, bool)
             or not isinstance(self.read_chunk_size, int)
             or not 1 <= self.read_chunk_size <= 16 * 1024 * 1024
         ):
             raise StorageConfigurationError("S3 read_chunk_size must be between 1 byte and 16 MiB.")
+        if (
+            isinstance(self.max_concurrent_downloads, bool)
+            or not isinstance(self.max_concurrent_downloads, int)
+            or not 1 <= self.max_concurrent_downloads <= 256
+        ):
+            raise StorageConfigurationError(
+                "S3 max_concurrent_downloads must be between 1 and 256."
+            )
+        if self.read_chunk_size * self.max_concurrent_downloads > _MAX_STREAM_BUFFER_BYTES:
+            raise StorageConfigurationError(
+                "S3 read_chunk_size multiplied by max_concurrent_downloads must not exceed 64 MiB."
+            )
         if (
             isinstance(self.max_pool_connections, bool)
             or not isinstance(self.max_pool_connections, int)

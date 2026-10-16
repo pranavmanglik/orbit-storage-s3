@@ -12,17 +12,17 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
   "aiobotocore>=3.8,<4",
-  "orbit-core>=0.1.0a1,<0.2",
   "orbit-storage>=0.1.0a1,<0.2",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2"]
+core = ["orbit-core>=0.1.0a1,<0.2"]
+dev = ["orbit-core>=0.1.0a1,<0.2", "pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orbit_storage_s3"]

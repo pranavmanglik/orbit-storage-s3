@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns an S3 object-store adapter."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_storage import OBJECT_STORE_DEPENDENCY_KEY
 
 from orbit_storage_s3.store import S3ObjectStore
@@ -34,6 +36,14 @@ class S3ObjectStorePlugin(Plugin):
         if not isinstance(store, S3ObjectStore):
             raise TypeError("S3ObjectStorePlugin requires an S3ObjectStore instance.")
         self.store = store
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check S3 bucket access",
+                description="List at most one object to verify read access to the bucket.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the adapter through the provider-neutral storage dependency key."""
@@ -44,6 +54,11 @@ class S3ObjectStorePlugin(Plugin):
     async def deactivate(self) -> None:
         """Close the SDK client during normal shutdown or partial-startup rollback."""
         await self.store.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Issue one bounded read-only list request without displaying object names."""
+        await self.store.list_page(limit=1)
+        return ControlResult("S3 bucket listing is available.")
 
 
 __all__ = ["S3ObjectStorePlugin"]

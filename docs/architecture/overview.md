@@ -6,7 +6,9 @@
 only when an application uses S3 or an S3-compatible service:
 
 ```bash
-python -m pip install orbit-core orbit-storage orbit-storage-s3
+python -m pip install orbit-storage orbit-storage-s3
+# Add the Core lifecycle plugin only when using it:
+python -m pip install 'orbit-storage-s3[core]'
 ```
 
 Configure credentials through aiobotocore's standard AWS credential chain (environment, shared
@@ -17,7 +19,8 @@ for a compatible object service; endpoint-specific behavior remains outside Core
 
 ```python
 from orbit import Application, ApplicationConfig
-from orbit_storage_s3 import S3Config, S3ObjectStore, S3ObjectStorePlugin
+from orbit_storage_s3 import S3Config, S3ObjectStore
+from orbit_storage_s3.plugin import S3ObjectStorePlugin
 
 application = Application(ApplicationConfig(name="reports"))
 store = S3ObjectStore(S3Config(bucket="orbit-reports", region_name="us-east-1"))
@@ -39,7 +42,10 @@ default, plus at most one source chunk) and abort incomplete multipart work afte
 cancellation. The maximum streamed object size is
 bounded by `part_size_bytes * max_parts`; increase the part size deliberately when larger objects
 are required, considering the corresponding per-upload memory use. This does not claim S3's full
-maximum object size for the default configuration.
+maximum object size for the default configuration. Downloads hold one of `max_concurrent_downloads`
+slots (16 by default, at most 256) for the full response lifetime. The product of `read_chunk_size`
+and that concurrency limit is capped at 64 MiB for Orbit-requested response chunks. Close each
+`StoredObject` before store shutdown and include provider and HTTP buffers in the memory budget.
 
 `delete` checks object existence before issuing `DeleteObject` to implement the capability's
 boolean result; concurrent deletion can race that check. S3 versioning, retention, encryption,
@@ -57,9 +63,9 @@ The following dependency declarations come from the checked-in manifests. Option
 
 ### `pyproject.toml`
 - `aiobotocore>=3.8,<4`
-- `orbit-core>=0.1.0a1,<0.2`
 - `orbit-storage>=0.1.0a1,<0.2`
-- Optional `dev` group: `pytest>=8,<10`, `pytest-asyncio>=0.24,<2`, `ruff>=0.8,<1`, `mypy>=1.13,<2`.
+- Optional `core` extra: `orbit-core>=0.1.0a1,<0.2` for `S3ObjectStorePlugin`.
+- Development dependencies: Core for lifecycle tests, plus pytest, pytest-asyncio, Ruff, and mypy.
 
 Declared dependencies do not mean that optional providers or services are bundled with this package.
 

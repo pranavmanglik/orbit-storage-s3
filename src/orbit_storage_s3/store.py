@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable, Mapping
-from contextlib import AsyncExitStack, suppress
+from collections.abc import AsyncIterable, Callable, Mapping
+from contextlib import suppress
 from typing import Any, Protocol, cast
 
 from aiobotocore.config import AioConfig  # type: ignore[import-untyped]
@@ -96,10 +96,11 @@ class _Session(Protocol):
 class _S3BodyReader:
     """Adapt aiobotocore's closeable StreamingBody to Orbit's async byte reader."""
 
-    def __init__(self, body: _Body, chunk_size: int) -> None:
+    def __init__(self, body: _Body, chunk_size: int, release_slot: Callable[[], None]) -> None:
         """Take ownership of the response stream returned by GetObject."""
         self._body = body
         self._chunk_size = chunk_size
+        self._release_slot = release_slot
         self._closed = False
 
     def __aiter__(self) -> _S3BodyReader:
@@ -113,6 +114,8 @@ class _S3BodyReader:
         try:
             chunk = await self._body.read(self._chunk_size)
         except asyncio.CancelledError:
+            with suppress(BaseException):
+                await self.aclose()
             raise
         except Exception:
             await self.aclose()
@@ -130,13 +133,15 @@ class _S3BodyReader:
     async def aclose(self) -> None:
         """Close the StreamingBody context once, releasing its HTTP connection."""
         if not self._closed:
+            self._closed = True
             try:
                 await self._body.__aexit__(None, None, None)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 raise StorageOperationError("S3 response stream close failed.") from None
-            self._closed = True
+            finally:
+                self._release_slot()
 
 
 class S3ObjectStore(ObjectStore):
@@ -148,9 +153,11 @@ class S3ObjectStore(ObjectStore):
             raise TypeError("S3ObjectStore requires an S3Config instance.")
         self.config = config
         self._session_factory = session_factory or get_session
-        self._stack = AsyncExitStack()
+        self._client_context: _ClientContext | None = None
         self._client: _S3Client | None = None
         self._client_lock = asyncio.Lock()
+        self._stream_upload_slots = asyncio.Semaphore(config.max_concurrent_stream_uploads)
+        self._download_slots = asyncio.Semaphore(config.max_concurrent_downloads)
         self._closed = False
 
     async def _get_client(self) -> _S3Client:
@@ -166,15 +173,20 @@ class S3ObjectStore(ObjectStore):
                             connect_timeout=self.config.connect_timeout_seconds,
                             read_timeout=self.config.read_timeout_seconds,
                             max_pool_connections=self.config.max_pool_connections,
+                            retries={
+                                "mode": "standard",
+                                "total_max_attempts": self.config.total_max_attempts,
+                            },
                         )
                     }
                     if self.config.region_name is not None:
                         options["region_name"] = self.config.region_name
                     if self.config.endpoint_url is not None:
                         options["endpoint_url"] = self.config.endpoint_url
-                    self._client = await self._stack.enter_async_context(
-                        session.create_client("s3", **options)
-                    )
+                    context = session.create_client("s3", **options)
+                    client = await context.__aenter__()
+                    self._client_context = context
+                    self._client = client
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -241,7 +253,10 @@ class S3ObjectStore(ObjectStore):
             )
         if not hasattr(body, "__aiter__"):
             raise StorageConfigurationError("S3 upload body must be bytes or an async byte stream.")
-        return await self._put_stream(object_key, body, validated.content_type, validated.metadata)
+        async with self._stream_upload_slots:
+            return await self._put_stream(
+                object_key, body, validated.content_type, validated.metadata
+            )
 
     async def _put_bytes(
         self,
@@ -393,36 +408,46 @@ class S3ObjectStore(ObjectStore):
     async def get(self, key: str) -> StoredObject | None:
         """Return metadata and a closeable, incrementally-read S3 response body."""
         object_key = self._key(key)
-        client = await self._get_client()
+        await self._download_slots.acquire()
+        slot_transferred = False
         try:
-            response = await client.get_object(Bucket=self.config.bucket, Key=object_key)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if self._not_found(error):
-                return None
-            raise StorageOperationError("S3 get_object operation failed.") from None
-        body = cast(_Body, response.get("Body"))
-        try:
-            stream = await body.__aenter__()
-            info = self._info(
-                object_key,
-                size=response.get("ContentLength"),
-                content_type=response.get("ContentType"),
-                etag=response.get("ETag"),
-                modified_at=response.get("LastModified"),
-                metadata=response.get("Metadata", {}),
+            client = await self._get_client()
+            try:
+                response = await client.get_object(Bucket=self.config.bucket, Key=object_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if self._not_found(error):
+                    return None
+                raise StorageOperationError("S3 get_object operation failed.") from None
+            body = cast(_Body, response.get("Body"))
+            try:
+                stream = await body.__aenter__()
+                info = self._info(
+                    object_key,
+                    size=response.get("ContentLength"),
+                    content_type=response.get("ContentType"),
+                    etag=response.get("ETag"),
+                    modified_at=response.get("LastModified"),
+                    metadata=response.get("Metadata", {}),
+                )
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await body.__aexit__(None, None, None)
+                raise
+            except Exception:
+                with suppress(Exception):
+                    await body.__aexit__(None, None, None)
+                raise StorageOperationError("S3 returned an invalid object response.") from None
+            reader = _S3BodyReader(
+                stream, self.config.read_chunk_size, self._download_slots.release
             )
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                await body.__aexit__(None, None, None)
-            raise
-        except Exception:
-            with suppress(Exception):
-                await body.__aexit__(None, None, None)
-            raise StorageOperationError("S3 returned an invalid object response.") from None
-        reader = _S3BodyReader(stream, self.config.read_chunk_size)
-        return StoredObject(info=info, body=reader)
+            stored = StoredObject(info=info, body=reader)
+            slot_transferred = True
+            return stored
+        finally:
+            if not slot_transferred:
+                self._download_slots.release()
 
     async def delete(self, key: str) -> bool:
         """Delete an object and report whether a preceding existence check found it."""
@@ -488,18 +513,22 @@ class S3ObjectStore(ObjectStore):
             raise StorageOperationError("S3 list_objects_v2 operation failed.") from None
 
     async def aclose(self) -> None:
-        """Close the retained aiobotocore client; repeated calls are safe."""
+        """Close the SDK client and retain its context when cleanup fails for a later retry."""
         async with self._client_lock:
-            if self._closed:
+            context = self._client_context
+            if self._closed and context is None:
                 return
             self._closed = True
+            if context is None:
+                return
             try:
-                await self._stack.aclose()
+                await context.__aexit__(None, None, None)
             except asyncio.CancelledError:
-                self._closed = False
                 raise
             except Exception:
                 raise StorageOperationError("S3 client shutdown failed.") from None
+            self._client_context = None
+            self._client = None
 
 
 __all__ = ["S3ObjectStore"]
